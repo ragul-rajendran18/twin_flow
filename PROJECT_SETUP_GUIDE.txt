@@ -1,0 +1,338 @@
+================================================================================
+                         TWINFLOW - PROJECT SETUP GUIDE
+              Complete setup on a new system (Backend + Frontend)
+================================================================================
+
+This guide takes a brand-new machine from zero to a working TwinFlow stack.
+
+  Prerequisites
+    - Python 3.11 or newer   (verified on 3.13)
+    - Node.js 18 or newer    (verified on 22) + npm
+    - PostgreSQL 14 or newer (verified on 18)
+    - Git (optional)
+
+  Folder layout expected on the new system
+    <project-root>/
+      warehouse-congestion-backend/     FastAPI backend
+      twinflow/                         Vite React frontend
+
+
+================================================================================
+SECTION 1 - DATABASE CONNECTION (PostgreSQL)
+================================================================================
+
+1.1  Install PostgreSQL and make sure the service is running.
+
+     Check from a terminal:
+         pg_isready -h localhost -p 5432
+     Expected:  localhost:5432 - accepting connections
+
+1.2  Create a dedicated database and (optionally) a dedicated role.
+
+     Open psql as the postgres superuser:
+         psql -U postgres -h localhost
+
+     Then run:
+         CREATE DATABASE warehouse_db;
+         CREATE USER twinflow_user WITH PASSWORD 'CHANGE_ME_strong_password';
+         GRANT ALL PRIVILEGES ON DATABASE warehouse_db TO twinflow_user;
+
+     (You may also just reuse the default "postgres" superuser for local
+      development - that is what the sample .env does.)
+
+1.3  Connection string format used by the app
+
+         postgresql+psycopg://<USER>:<PASSWORD>@localhost:5432/<DB_NAME>
+
+     Examples:
+         postgresql+psycopg://postgres:ragul1810@localhost:5432/warehouse_db
+         postgresql+psycopg://twinflow_user:CHANGE_ME_strong_password@localhost:5432/warehouse_db
+
+     NOTE: the password inside the URL must be URL-escaped if it contains
+     special characters like @ # ? / .
+
+
+================================================================================
+SECTION 2 - BACKEND SETUP
+================================================================================
+
+2.1  Copy the project folder to the new system.
+
+         <project-root>/warehouse-congestion-backend/
+
+2.2  Create and activate a virtual environment (PowerShell shown; on Linux/macOS
+     use `python3 -m venv .venv` and `source .venv/bin/activate`).
+
+         cd warehouse-congestion-backend
+         python -m venv .venv
+         .\.venv\Scripts\Activate.ps1
+
+     If PowerShell blocks activation scripts, run once as administrator:
+         Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+
+2.3  Install Python dependencies.
+
+         .\.venv\Scripts\python.exe -m pip install --upgrade pip
+         .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+
+     This installs: fastapi, uvicorn, sqlalchemy, psycopg (PostgreSQL driver),
+     pydantic + pydantic-settings, alembic, scikit-learn, pandas, numpy,
+     joblib, pwdlib (Argon2), PyJWT, email-validator, pytest, httpx.
+
+
+================================================================================
+SECTION 3 - .ENV SETUP (backend/.env)
+================================================================================
+
+3.1  Create the file  warehouse-congestion-backend/.env
+     (a template exists as .env.example - copy it and edit).
+
+         copy .env.example .env          (Windows)
+         cp .env.example .env            (Linux/macOS)
+
+3.2  Fill in every variable. Full annotated template:
+
+         ------------------------------------------------------------------
+         # --- Database -----------------------------------------------------
+         # Sync SQLAlchemy URL (used by the app, Alembic and the scripts).
+         DATABASE_URL=postgresql+psycopg://postgres:YOUR_DB_PASSWORD@localhost:5432/warehouse_db
+
+         # Echo SQL statements to the log (true/false). Keep false in prod.
+         DB_ECHO=false
+
+         # --- Application --------------------------------------------------
+         APP_NAME=warehouse-congestion-backend
+         APP_VERSION=1.0.0
+         LOG_LEVEL=INFO
+
+         # --- Authentication ------------------------------------------------
+         # REQUIRED. Without it every login/register call returns
+         # 503 "JWT_SECRET_KEY must be configured to use authentication."
+         # Generate a fresh random value on EVERY new system, e.g.:
+         #   python -c "import secrets; print(secrets.token_hex(32))"
+         JWT_SECRET_KEY=PASTE_THE_RANDOM_HEX_STRING_HERE
+         JWT_ACCESS_TOKEN_EXPIRE_MINUTES=30
+
+         # --- CORS / frontend ----------------------------------------------
+         # Comma-separated exact origins of the frontend.
+         FRONTEND_ORIGIN=http://localhost:5173
+         CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000
+
+         # --- Limits --------------------------------------------------------
+         MAX_BATCH_SIZE=50
+         MAX_SIMULATION_EVENTS=500
+         MAX_PAGE_SIZE=100
+
+         # --- ML ------------------------------------------------------------
+         ARTIFACTS_DIR=ml/artifacts
+         CONGESTION_THRESHOLD_MODERATE=0.40
+         CONGESTION_THRESHOLD_HIGH=0.70
+         BOTTLENECK_THRESHOLD=0.50
+         ------------------------------------------------------------------
+
+     Rules:
+       - JWT_SECRET_KEY must be at least 32 characters and MUST NOT be
+         reused from another project or committed to version control.
+       - If the backend port changes, add that origin to CORS_ORIGINS.
+       - Settings are read at process start - restart the server after edits.
+
+
+================================================================================
+SECTION 4 - DATABASE MIGRATIONS + ML MODEL + FIRST ADMIN
+================================================================================
+
+All commands below are run from  warehouse-congestion-backend/  with the
+virtual environment active.
+
+4.1  Run Alembic migrations (creates all tables: users, warehouse_aisles,
+     warehouse_events, predictions, alerts).
+
+         .\.venv\Scripts\python.exe -m alembic upgrade head
+
+4.2  Train the ML models (creates ml/artifacts/*.joblib). Without this,
+     POST /api/v1/predictions/run returns 503 "model not trained".
+
+         .\.venv\Scripts\python.exe -m ml.generate_dataset --rows 8000 --seed 42
+         .\.venv\Scripts\python.exe -m ml.train_model --dataset ml/artifacts/dataset.csv
+
+     Generated artifacts:
+         ml/artifacts/dataset.csv
+         ml/artifacts/congestion_model.joblib
+         ml/artifacts/bottleneck_model.joblib
+         ml/artifacts/queue_model.joblib
+         ml/artifacts/delay_model.joblib
+
+4.3  OPTIONAL: seed the 8 standard aisles from the CLI.
+
+         .\.venv\Scripts\python.exe scripts\seed_warehouse.py
+
+     (The same seeding is also available from the UI: Simulation page ->
+      "Seed simulation", which is the recommended way.)
+
+4.4  Create the FIRST ADMINISTRATOR account.
+
+     Self-registration always creates "operator" accounts, so the first
+     admin must be bootstrapped from the CLI. The interactive script asks
+     for full name, email, and a password of at least 12 characters:
+
+         .\.venv\Scripts\python.exe scripts\create_admin.py
+
+     Example session:
+         Administrator full name: ragulrajendran
+         Administrator email: ragul@gmail.com
+         Administrator password (12+ characters): **********
+         Confirm password: **********
+         Created administrator account for ragul@gmail.com (user id 3).
+
+     The script refuses to run if an administrator already exists.
+     NOTE: on the original development machine an admin already exists
+     (ragul@gmail.com). On a NEW system you must run this script again.
+
+4.5  All other manager/admin accounts are created from the web UI:
+     sign in as admin -> Users page -> change the Role dropdown.
+
+
+================================================================================
+SECTION 5 - START THE BACKEND
+================================================================================
+
+         .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+
+     Add  --reload  during development for auto-restart on code changes.
+
+     Verify:
+         http://127.0.0.1:8000/health          -> {"message":"ok"}
+         http://127.0.0.1:8000/health/db       -> {"message":"healthy",...}
+         http://127.0.0.1:8000/docs            -> Swagger UI
+
+     Linux/macOS one-liner equivalent:
+         .venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+
+
+================================================================================
+SECTION 6 - FRONTEND SETUP
+================================================================================
+
+6.1  Install Node.js 18+ (https://nodejs.org). Verify:
+
+         node -v      e.g. v22.20.0
+         npm -v       e.g. 10.9.3
+
+6.2  Install dependencies.
+
+         cd twinflow
+         npm install
+
+6.3  Optional: create twinflow/.env from .env.example.
+
+         # Vite dev-server proxy target (backend address)
+         VITE_BACKEND_URL=http://127.0.0.1:8000
+
+         # Leave empty -> the browser calls the backend through the Vite
+         # proxy (same-origin, no CORS needed). This is the default and
+         # recommended mode for development.
+         VITE_API_BASE_URL=
+
+     If you set VITE_API_BASE_URL to an absolute URL (for example
+     http://127.0.0.1:8000 or a deployed host), the browser calls the
+     backend DIRECTLY and that origin must be listed in the backend's
+     CORS_ORIGINS.
+
+6.4  Start the dev server (terminal 2; keep the backend running in
+     terminal 1).
+
+         npm run dev
+
+     Open  http://localhost:5173  - the sidebar footer should show
+     "API online" in green. Sign in with the admin created in 4.4.
+
+6.5  Production build (optional).
+
+         npm run build        # type-checks with tsc, emits dist/
+         npm run preview      # serves the dist/ build locally
+
+     To serve dist/ behind another host, set VITE_API_BASE_URL at build
+     time and configure CORS_ORIGINS on the backend accordingly.
+
+
+================================================================================
+SECTION 7 - FIRST-RUN WORKFLOW (smoke test)
+================================================================================
+
+  1. Start backend  (Section 5)  and frontend  (Section 6.4).
+  2. Register a normal account at /register (role: Operator) OR sign in
+     as the admin from 4.4.
+  3. As admin, open Simulation -> "Seed simulation" (creates 8 aisles,
+     optionally with historical events) -> "Generate events" (e.g. 20).
+  4. Click "Run predictions" (Dashboard or Predictions page).
+  5. Dashboard now shows congestion KPIs; Alerts page shows raised alerts;
+     resolve one as admin/manager.
+  6. Use Users page to promote an operator to manager/admin.
+
+
+================================================================================
+SECTION 8 - TROUBLESHOOTING
+================================================================================
+
+  502 / "Cannot reach the API server" from the frontend
+      -> The backend is not running or is on another port.
+         Start uvicorn; if it is not on port 8000, update
+         VITE_BACKEND_URL and restart `npm run dev`.
+
+  503 "JWT_SECRET_KEY must be configured to use authentication."
+      -> JWT_SECRET_KEY is missing/empty in backend/.env. Add it and
+         RESTART the backend.
+
+  503 "model not trained" from /predictions/run
+      -> Run the two ML commands in Section 4.2 and restart the backend.
+
+  CORS error in the browser (blocked by CORS policy)
+      -> The frontend origin is not in CORS_ORIGINS, or you set a
+         VITE_API_BASE_URL that differs from what is allowed. Either add
+         the exact origin (scheme + host + port, no trailing slash) to
+         CORS_ORIGINS and restart, or leave VITE_API_BASE_URL empty to
+         use the Vite proxy.
+
+  Password authentication fails / "relation does not exist"
+      -> Migrations were not run. Execute `alembic upgrade head` (4.1).
+
+  psycopg / connection refused on 5432
+      -> PostgreSQL is not installed or not running; verify DATABASE_URL
+         user, password, host, port and database name.
+
+  Admin cannot access /users
+      -> The account is not role "admin". Bootstrap one with
+         scripts\create_admin.py or promote the account from the Users
+         page using an existing admin.
+
+  npm / node errors
+      -> Delete node_modules and package-lock.json, then `npm install`
+         again with a supported Node version (18+).
+
+
+================================================================================
+SECTION 9 - QUICK COMMAND REFERENCE (Windows PowerShell)
+================================================================================
+
+  # ---- Backend (terminal 1) ----
+  cd <project-root>\warehouse-congestion-backend
+  .\.venv\Scripts\python.exe -m alembic upgrade head
+  .\.venv\Scripts\python.exe -m ml.generate_dataset --rows 8000 --seed 42
+  .\.venv\Scripts\python.exe -m ml.train_model --dataset ml/artifacts\dataset.csv
+  .\.venv\Scripts\python.exe scripts\create_admin.py
+  .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+
+  # ---- Frontend (terminal 2) ----
+  cd <project-root>\twinflow
+  npm install
+  npm run dev
+
+  # ---- Tests ----
+  cd <project-root>\warehouse-congestion-backend
+  .\.venv\Scripts\python.exe -m pytest -q
+
+  # Linux/macOS: replace .\.venv\Scripts\python.exe with .venv/bin/python
+
+================================================================================
+                            END OF SETUP GUIDE
+================================================================================

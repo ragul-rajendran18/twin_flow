@@ -1,0 +1,365 @@
+================================================================================
+                         TWINFLOW - PROJECT DOCUMENTATION
+        Smart Warehouse Congestion Prediction & Digital Twin Platform
+================================================================================
+
+Project root : R:\warehouse
+  |-- warehouse-congestion-backend/   (FastAPI + PostgreSQL + ML backend)
+  |-- twinflow/                       (Vite + React frontend)
+
+This document describes, separately for the backend and the frontend:
+  1. Technical stack
+  2. Module / folder structure
+  3. Working modules (features)
+  4. API surface consumed / exposed
+
+
+================================================================================
+PART A - BACKEND  (warehouse-congestion-backend)
+================================================================================
+
+--------------------------------------------------------------------------------
+A1. TECHNICAL STACK
+--------------------------------------------------------------------------------
+Language           : Python 3.11+
+Web framework      : FastAPI 0.115+
+Server             : Uvicorn (ASGI)
+Database           : PostgreSQL 18 (driver: psycopg 3)
+ORM                : SQLAlchemy 2.0 (declarative, sync sessions)
+Migrations         : Alembic
+Validation/Schemas : Pydantic v2 + pydantic-settings (env-based config)
+Authentication     : JWT bearer tokens (PyJWT, HS256) + Argon2 password
+                     hashing (pwdlib)
+ML                 : scikit-learn (RandomForest), pandas, numpy, joblib
+Testing            : pytest + FastAPI TestClient (SQLite test DB)
+CORS               : FastAPI CORSMiddleware, origins from env config
+
+--------------------------------------------------------------------------------
+A2. MODULE STRUCTURE
+--------------------------------------------------------------------------------
+app/
+  main.py                 Application factory, CORS, routers, exception handlers
+  config.py               Settings loaded from environment / .env file
+  database.py             SQLAlchemy engine + session factory + DB health check
+  dependencies.py         get_session dependency
+  core/
+    security.py           Password hashing, JWT create/decode
+    dependencies.py       get_current_user, require_role (role guards)
+  models/                 SQLAlchemy ORM models
+    user.py               users (id, full_name, email, hashed_password, role,
+                          is_active, timestamps)
+    aisle.py              warehouse_aisles (code, name, capacity, zone, active)
+    warehouse_event.py    warehouse_events (occupancy, agv_count, queue_length,
+                          order_volume, conveyor_load, timestamp, source)
+    prediction.py         predictions (probability, level, bottleneck,
+                          predicted queue/delay, recommendation, model_version)
+    alert.py              alerts (type, severity, message, status, resolved_at)
+  schemas/                Pydantic request/response models per domain
+  routers/                API route handlers (see A4)
+  services/               Business logic
+    auth_service.py       create_user, authenticate_user, duplicate checks
+    ingestion_service.py  event validation, dedupe, batch ingest
+    warehouse_service.py  overview aggregation, latest event/prediction per aisle
+    prediction_service.py run ML predictions for all/single aisle
+    alert_service.py      raise/resolve alerts from predictions
+    recommendation_service.py  text recommendations per congestion level
+  utils/
+    pagination.py         Generic paginated response builder
+    dummy_data.py         8 seeded aisles + scenario generators
+  ml/
+    generate_dataset.py   Synthetic labelled training data
+    train_model.py        Trains RandomForest, saves artifact + metrics
+    predict.py            Loads model, predicts congestion/bottleneck
+    evaluate_model.py     Model evaluation metrics
+scripts/
+  create_admin.py         Interactive bootstrap of the first administrator
+  seed_warehouse.py       Seed aisles
+  simulate_events.py      Generate synthetic events
+alembic/                  Migration env + 0001 schema, 0002 users
+tests/                    pytest suite (auth + role protection)
+
+--------------------------------------------------------------------------------
+A3. WORKING MODULES (FEATURES)
+--------------------------------------------------------------------------------
+
+1) AUTHENTICATION & AUTHORIZATION
+   - Public registration. New accounts are ALWAYS created with the operator
+     role (privilege escalation is blocked at the API level).
+   - Login returns a short-lived bearer JWT (default 30 min, configurable).
+   - GET /me returns the signed-in user profile.
+   - Change password (requires current password; min 12 chars).
+   - Role guard: require_role(ADMIN) / require_role(ADMIN, MANAGER).
+   - 401 responses carry WWW-Authenticate: Bearer.
+
+2) USER MANAGEMENT (admin only)
+   - List users (paginated), get one, update name/email.
+   - Activate / deactivate a user.
+   - Change a user's role (admin | manager | operator).
+   - Safety rule: the LAST active administrator cannot be demoted or
+     deactivated (HTTP 409 "last_active_admin").
+
+3) AISLE MANAGEMENT
+   - Read: any authenticated user (list, filter by zone/active, detail,
+     per-aisle event history).
+   - Write: admin only (create, patch). Duplicate aisle codes -> 409.
+
+4) EVENT INGESTION
+   - Single event POST and batch POST (max batch size configurable,
+     default 50). Available to admin and manager.
+   - Validates ranges (occupancy 0-100, conveyor_load 0-100, non-negative
+     counts), unknown aisle -> 404, duplicate event_id -> 409 / counted in
+     batch results.
+
+5) WAREHOUSE MONITORING (dashboard APIs)
+   - /overview : total/active aisles, normal/moderate/high counts,
+     active alert count, average occupancy, total AGVs, total queue
+     length, last event timestamp. Aisles without events count as normal.
+   - /aisles   : latest event + latest prediction (congestion level) per aisle.
+   - /events   : paginated telemetry with filters (aisle_code, source,
+     start_time, end_time).
+
+6) ML PREDICTIONS
+   - /run            (admin/manager): runs the trained model over the latest
+     event of every active aisle (or one aisle). Creates predictions and
+     auto-raises or auto-updates alerts. Returns model version, counts.
+   - /latest         : newest prediction per aisle (optionally filtered).
+   - /history        : paginated prediction history.
+   - /{prediction_id}: single prediction with joined event payload.
+   - Model output: congestion_probability, congestion_level
+     (NORMAL/MODERATE/HIGH via 0.40 / 0.70 thresholds), bottleneck_detected,
+     predicted_queue_length, predicted_delay_minutes, recommendation text,
+     model_version.
+   - Returns 503 if the model artifact has not been trained yet.
+
+7) ALERTS
+   - List with filters (status, severity, alert_type, aisle_code, time range).
+   - GET /active : all ACTIVE alerts sorted HIGH > MEDIUM > LOW, newest first.
+   - PATCH /{id}/resolve (admin/manager): resolves the alert and stamps
+     resolved_at; returns {message, alert_id, status}. Resolving a
+     non-active alert is tolerated and reported in the message.
+   - Alerts auto-resolve when a newer prediction for that aisle is clean.
+
+8) SIMULATION (synthetic data, admin/manager writes)
+   - /seed     : creates the 8 standard aisles (AISLE_A..AISLE_H across
+     ZONE_1..ZONE_4). Re-running is safe (existing aisles skipped).
+     Optionally generates a historical event batch.
+   - /generate : pushes N synthetic events (max 500 default) through the
+     real ingestion service.
+   - /step     : advances every active aisle (or a listed subset) by one
+     interval.
+   - Scenarios: normal, moderate, high_congestion, bottleneck, mixed.
+   - /status (any user): seeded/active aisle counts, total events, latest
+     timestamp, supported scenarios, max batch limit.
+
+9) HEALTH
+   - GET /health     : liveness.
+   - GET /health/db  : database connectivity.
+
+10) CROSS-CUTTING
+    - CORS from env (CORS_ORIGINS), credentials allowed.
+    - Global exception handlers: validation 422, SQLAlchemy 500, generic 500.
+    - Pagination helper returns {total, page, page_size, items}.
+
+--------------------------------------------------------------------------------
+A4. API SURFACE (all under /api/v1 except health)
+--------------------------------------------------------------------------------
+AUTH
+  POST   /auth/register           public, returns operator user
+  POST   /auth/login              public, returns {access_token, expires_in}
+  GET    /auth/me                 bearer
+  POST   /auth/change-password    bearer
+
+USERS (admin only)
+  GET    /users/                  paginated
+  GET    /users/{id}
+  PATCH  /users/{id}              {full_name?, email?}
+  PATCH  /users/{id}/status       {is_active}
+  PATCH  /users/{id}/role         {role}
+
+AISLES
+  GET    /aisles                  paginated, ?zone=&is_active=&page=&page_size=
+  POST   /aisles                  admin
+  GET    /aisles/{id}             status view (latest metrics + congestion)
+  PATCH  /aisles/{id}             admin
+  GET    /aisles/{id}/history     paginated events, ?start_time=&end_time=
+
+INGESTION (admin/manager)
+  POST   /ingestion/events
+  POST   /ingestion/events/batch
+
+WAREHOUSE (any user)
+  GET    /warehouse/overview
+  GET    /warehouse/aisles
+  GET    /warehouse/events        paginated, ?aisle_code=&source=&start_time=&end_time=
+
+PREDICTIONS
+  POST   /predictions/run         admin/manager, body {aisle_code?}
+  GET    /predictions/latest      ?congestion_level=&aisle_code=
+  GET    /predictions/history     paginated
+  GET    /predictions/{prediction_id}
+
+ALERTS
+  GET    /alerts                  paginated, ?status=&severity=&alert_type=&aisle_code=
+  GET    /alerts/active
+  PATCH  /alerts/{id}/resolve     admin/manager
+
+SIMULATION
+  POST   /simulation/seed         admin/manager
+  POST   /simulation/generate     admin/manager
+  POST   /simulation/step         admin/manager
+  GET    /simulation/status
+
+HEALTH (public)
+  GET    /health
+  GET    /health/db
+
+Interactive docs:  http://127.0.0.1:8000/docs   (Swagger)
+ReDoc:             http://127.0.0.1:8000/redoc
+
+
+================================================================================
+PART B - FRONTEND  (twinflow)
+================================================================================
+
+--------------------------------------------------------------------------------
+B1. TECHNICAL STACK
+--------------------------------------------------------------------------------
+Build tool        : Vite 8
+UI library        : React 19
+Language          : TypeScript (strict, tsc -b on build)
+Routing           : react-router-dom v7 (BrowserRouter, nested protected routes)
+HTTP client       : axios (request interceptor attaches Bearer token;
+                    response interceptor auto-logs out on 401)
+State             : React Context (AuthContext) + local component state
+Styling           : hand-written CSS (src/index.css), dark industrial theme,
+                    color-scheme: dark for native controls
+Linting           : oxlint
+Dev server        : port 5173 with reverse proxy for /api and /health to the
+                    backend (no CORS needed in development)
+
+--------------------------------------------------------------------------------
+B2. STRUCTURE
+--------------------------------------------------------------------------------
+twinflow/
+  vite.config.ts          Dev proxy: /api and /health -> http://127.0.0.1:8000
+  index.html              App shell, title "TwinFlow"
+  .env.example            VITE_BACKEND_URL, VITE_API_BASE_URL
+  src/
+    main.tsx              createRoot + BrowserRouter + AuthProvider
+    App.tsx               Route table with Guest/Protected/Admin guards
+    index.css             Global theme (shell, cards, tables, badges, forms)
+    api/
+      client.ts           axios instance, token storage key, 401 interceptor,
+                          extractErrorMessage (handles string/array/object
+                          FastAPI error details)
+      types.ts            TypeScript interfaces mirroring the Pydantic schemas
+      endpoints.ts        Typed functions for every backend endpoint
+    auth/
+      AuthContext.tsx     login/register/logout/refreshUser, isAuthenticated,
+                          isAdmin, canOperate flags
+    components/
+      Layout.tsx          Sidebar nav + topbar + API online/offline indicator
+      PageHeader.tsx      Page title + subtitle + action buttons
+      StatCard.tsx        KPI card
+      Badge.tsx           Colored badges + toneForLevel (congestion colors)
+      Pagination.tsx      Prev/Next pager for paginated endpoints
+      Spinner.tsx, ErrorBanner.tsx
+    pages/                One file per feature (see B3)
+    utils/format.ts       Date / percent / number formatting helpers
+
+--------------------------------------------------------------------------------
+B3. WORKING MODULES (PAGES / FEATURES)
+--------------------------------------------------------------------------------
+
+1) LOGIN (/login)
+   - Email + password, stores JWT in localStorage (twinflow.token),
+     redirects to the dashboard. Backend-error messages are surfaced.
+
+2) REGISTER (/register)
+   - Full name, email, password (min 12 chars), and a Role select with a
+     "Select role..." placeholder. Operator is the only self-serve option;
+     Manager/Admin options are visible but disabled (assigned by an admin).
+     On success the account is logged in automatically.
+
+3) LAYOUT / SHELL
+   - Sidebar: Dashboard, Aisles, Events, Predictions, Alerts, Simulation,
+     Users (admin only), Profile. Role-filtered.
+   - Topbar: user name + role badge + Sign out.
+   - Footer dot: live /health check showing "API online / offline".
+
+4) DASHBOARD (/)
+   - 8 KPI stat cards: total aisles, normal, moderate, high congestion,
+     active alerts, average occupancy, AGVs in motion, total queue.
+   - Aisle status table (occupancy bar, AGVs, queue, congestion badge,
+     last update) with row-click navigation to the aisle detail.
+   - Active alerts panel and latest predictions panel.
+   - Auto-refresh every 30 s + manual Refresh; "Run predictions" button
+     for admin/manager.
+
+5) AISLES (/aisles)
+   - Paginated table with zone and active/inactive filters.
+   - Admin: "New aisle" form and per-row "Edit" (code is immutable on edit).
+   - Click a row -> aisle detail.
+
+6) AISLE DETAIL (/aisles/:id)
+   - Status cards: occupancy, AGV count, queue length, order volume,
+     conveyor load, congestion level.
+   - Paginated event history table for that aisle.
+
+7) EVENTS (/events)
+   - Paginated warehouse telemetry with filters: aisle code, source,
+     from/to datetime. Shows occupancy, AGVs, queue, orders, conveyor,
+     source badge, timestamp.
+
+8) PREDICTIONS (/predictions)
+   - Tabs: "Latest per aisle" and "History" (paginated).
+   - Filters: congestion level, aisle code.
+   - "Run predictions" button (admin/manager) reports model version and
+     how many predictions/alerts were created or updated.
+
+9) ALERTS (/alerts)
+   - Tabs: "Active" (severity-sorted) and "All" (paginated, filterable by
+     status, severity, type).
+   - "Resolve" button (admin/manager) on active alerts; shows the API
+     confirmation message.
+
+10) SIMULATION (/simulation)  (admin/manager)
+    - Status cards: seeded aisles, active aisles, total events, latest event.
+    - Step 1: Seed aisles (optional historical events, scenario select).
+    - Step 2: Generate N events (bounded by the backend max).
+    - Step 3: Advance one step for all active aisles.
+
+11) USERS (/users)  (admin only)
+    - Paginated user table.
+    - Inline edit of name/email, role dropdown (admin/manager/operator),
+      enable/disable toggle.
+    - The signed-in admin cannot disable their own account; the backend
+      additionally protects the last active admin.
+
+12) PROFILE (/profile)
+    - Account summary card + change-password form (current, new, confirm;
+      min 12 chars, must differ from current).
+
+--------------------------------------------------------------------------------
+B4. CONNECTION TO THE BACKEND
+--------------------------------------------------------------------------------
+Development (default)
+  - Browser calls same-origin paths (/api/v1/..., /health).
+  - Vite dev server proxies them to VITE_BACKEND_URL
+    (default http://127.0.0.1:8000). No CORS involved.
+
+Production / direct mode
+  - Set VITE_API_BASE_URL to the full backend URL (e.g.
+    http://127.0.0.1:8000) in twinflow/.env; the axios baseURL becomes
+    "<VITE_API_BASE_URL>/api/v1" and the browser hits the backend directly.
+    The backend must allow the frontend origin in CORS_ORIGINS.
+
+Security model
+  - Token stored in localStorage, attached as "Authorization: Bearer <jwt>".
+  - Any 401 clears the token and redirects the user to /login.
+  - Route guards: GuestOnly (/login, /register), Protected (everything
+    under the Layout), AdminOnly (/users).
+
+================================================================================
+                             END OF DOCUMENT
+================================================================================

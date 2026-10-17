@@ -1,0 +1,26 @@
+# Environment and secrets
+.env
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Generated ML artifacts
+ml/artifacts/*.joblib
+ml/artifacts/metadata.json
+ml/artifacts/*.csv
+
+# Databases / local data
+*.db
+*.sqlite3
+
+# IDE
+.vscode/
+.idea/
